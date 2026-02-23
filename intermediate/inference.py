@@ -15,7 +15,7 @@ import nibabel as nib
 from tqdm import tqdm
 from typing import Tuple, Optional
 
-from model import DualEncoderCrossAttentionUNet
+from dual_encoder_model import DualEncoderCrossAttentionUNet
 from dataset import PairedPETCTDataset
 
 
@@ -27,9 +27,12 @@ class InferenceEngine:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.args = checkpoint['args']
         
-        # Initialize model
+        # Initialize model with same config used during training
         self.model = DualEncoderCrossAttentionUNet(
-            base_channels=self.args.base_channels
+            base_channels=self.args.base_channels,
+            cross_attention=getattr(self.args, 'cross_attention', True),
+            disagreement_attention=getattr(self.args, 'disagreement_attention', False),
+            num_heads=getattr(self.args, 'num_heads', 4),
         )
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model = self.model.to(self.device)
@@ -119,7 +122,11 @@ class InferenceEngine:
                             
                             # Forward pass
                             with autocast(enabled=True):
-                                psma_logits, fdg_logits = self.model(psma_patch, fdg_patch)
+                                model_out = self.model(psma_patch, fdg_patch)
+                                if isinstance(model_out, tuple) and len(model_out) == 3:
+                                    psma_logits, fdg_logits, _ = model_out
+                                else:
+                                    psma_logits, fdg_logits = model_out
                             
                             # Apply inverse flips to predictions
                             if flip_w:

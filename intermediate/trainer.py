@@ -19,7 +19,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from dual_encoder_model import DualEncoderCrossAttentionUNet, combined_loss
+from dual_encoder_model import DualEncoderCrossAttentionUNet, combined_loss, soft_dice_loss
 from dataset import PairedPETCTDataset
 
 
@@ -38,7 +38,16 @@ class Trainer:
             json.dump(vars(args), f, indent=2)
         
         # Initialize model
-        self.model = DualEncoderCrossAttentionUNet(base_channels=args.base_channels)
+        self.model = DualEncoderCrossAttentionUNet(
+            base_channels=args.base_channels,
+            cross_attention=args.cross_attention,
+            disagreement_attention=args.disagreement_attention,
+            num_heads=args.num_heads,
+        )
+
+        # Print parameter count
+        n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"Trainable parameters: {n_params:,}")
         
         # Multi-GPU support
         if torch.cuda.device_count() > 1 and args.multi_gpu:
@@ -103,9 +112,14 @@ class Trainer:
         self.best_val_dice = 0.0
         self.patience_counter = 0
         
-        # Class weights for loss
+        # Class weights for loss (only used in dice_ce mode)
         self.class_weights = torch.tensor([0.1, 2.0, 0.5], device=self.device)
-        
+
+        # Loss configuration
+        self.loss_mode = args.loss_mode
+        self.psma_loss_weight = args.psma_loss_weight
+        self.fdg_loss_weight = args.fdg_loss_weight
+
         # Cross-attention warmup
         self.cross_attn_warmup_epochs = args.cross_attn_warmup
         
@@ -161,8 +175,18 @@ class Trainer:
             
             # Mixed precision forward pass
             with autocast(enabled=self.args.amp):
-                psma_logits, fdg_logits = self.model(psma, fdg, cross_attn_weight)
-                losses = combined_loss(psma_logits, fdg_logits, labels, self.class_weights)
+                model_out = self.model(psma, fdg, cross_attn_weight)
+                # Handle both return formats (with/without disagree maps)
+                if isinstance(model_out, tuple) and len(model_out) == 3:
+                    psma_logits, fdg_logits, _ = model_out
+                else:
+                    psma_logits, fdg_logits = model_out
+                losses = combined_loss(
+                    psma_logits, fdg_logits, labels, self.class_weights,
+                    loss_mode=self.loss_mode,
+                    psma_weight=self.psma_loss_weight,
+                    fdg_weight=self.fdg_loss_weight,
+                )
             
             # Backward pass
             self.optimizer.zero_grad()
@@ -214,9 +238,14 @@ class Trainer:
                     patch_size=self.args.patch_size,
                     overlap=0.5
                 )
-                
+
                 # Compute losses
-                losses = combined_loss(psma_logits, fdg_logits, labels, self.class_weights)
+                losses = combined_loss(
+                    psma_logits, fdg_logits, labels, self.class_weights,
+                    loss_mode=self.loss_mode,
+                    psma_weight=self.psma_loss_weight,
+                    fdg_weight=self.fdg_loss_weight,
+                )
                 for key in val_losses:
                     if key in losses:
                         val_losses[key] += losses[key].item()
@@ -289,7 +318,11 @@ class Trainer:
                     
                     # Forward pass
                     with autocast(enabled=self.args.amp):
-                        psma_logits, fdg_logits = self.model(psma_patch, fdg_patch)
+                        model_out = self.model(psma_patch, fdg_patch)
+                        if isinstance(model_out, tuple) and len(model_out) == 3:
+                            psma_logits, fdg_logits, _ = model_out
+                        else:
+                            psma_logits, fdg_logits = model_out
                     
                     # Get actual patch size (may be smaller at boundaries)
                     actual_d = d_end - d
@@ -430,32 +463,49 @@ def main():
     # Model parameters
     parser.add_argument('--base_channels', type=int, default=32,
                         help='Base number of channels in U-Net')
-    parser.add_argument('--cross_attn_warmup', type=int, default=10,
-                        help='Number of epochs for cross-attention warmup')
+    parser.add_argument('--cross_attention', action='store_true', default=True,
+                        help='Enable cross-attention (default: True)')
+    parser.add_argument('--no_cross_attention', dest='cross_attention', action='store_false',
+                        help='Disable cross-attention (ablation)')
+    parser.add_argument('--disagreement_attention', action='store_true', default=False,
+                        help='Use disagreement-aware cross-attention')
+    parser.add_argument('--num_heads', type=int, default=4,
+                        help='Number of attention heads for disagreement attention')
+    parser.add_argument('--cross_attn_warmup', type=int, default=0,
+                        help='Number of epochs for cross-attention warmup (0=no warmup)')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=200,
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=2,
                         help='Batch size for training')
-    parser.add_argument('--patch_size', type=int, nargs=3, default=[96, 160, 96],
-                        help='Patch size for training')
+    parser.add_argument('--patch_size', type=int, nargs=3, default=[112, 192, 112],
+                        help='Patch size for training (default: 112x192x112 to match baselines)')
     parser.add_argument('--samples_per_epoch', type=int, default=250,
                         help='Number of samples per epoch')
     parser.add_argument('--foreground_ratio', type=float, default=0.33,
                         help='Ratio of foreground-focused patches')
     
-    # Optimization
-    parser.add_argument('--optimizer', type=str, default='adam',
-                        choices=['adam', 'sgd'], help='Optimizer')
-    parser.add_argument('--learning_rate', type=float, default=1e-3,
-                        help='Initial learning rate')
-    parser.add_argument('--weight_decay', type=float, default=1e-4,
+    # Optimization (defaults matched to nnU-Net baselines)
+    parser.add_argument('--optimizer', type=str, default='sgd',
+                        choices=['adam', 'sgd'], help='Optimizer (default: sgd to match baselines)')
+    parser.add_argument('--learning_rate', type=float, default=0.01,
+                        help='Initial learning rate (default: 0.01 to match baselines)')
+    parser.add_argument('--weight_decay', type=float, default=3e-5,
                         help='Weight decay')
     parser.add_argument('--scheduler', type=str, default='poly',
                         choices=['poly', 'cosine', 'none'], help='LR scheduler')
-    parser.add_argument('--gradient_clip', type=float, default=1.0,
-                        help='Gradient clipping value (0 to disable)')
+    parser.add_argument('--gradient_clip', type=float, default=0,
+                        help='Gradient clipping value (0=disabled, matching baselines)')
+
+    # Loss configuration
+    parser.add_argument('--loss_mode', type=str, default='dice',
+                        choices=['dice', 'dice_ce'],
+                        help='Loss function: dice (matched baseline) or dice_ce (original DECA)')
+    parser.add_argument('--psma_loss_weight', type=float, default=0.5,
+                        help='Weight for PSMA loss (default 0.5 = equal)')
+    parser.add_argument('--fdg_loss_weight', type=float, default=0.5,
+                        help='Weight for FDG loss (default 0.5 = equal)')
     
     # Validation
     parser.add_argument('--validate_every', type=int, default=5,
@@ -468,8 +518,8 @@ def main():
     # System
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loading workers')
-    parser.add_argument('--amp', action='store_true', default=True,
-                        help='Use automatic mixed precision')
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help='Use automatic mixed precision (off by default to match baselines)')
     parser.add_argument('--multi_gpu', action='store_true', default=False,
                         help='Use multiple GPUs if available')
     parser.add_argument('--cache_data', action='store_true', default=False,
